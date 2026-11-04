@@ -249,9 +249,13 @@ Update the app identifier, title, and other metadata:
 {
   "productName": "Your Mod Textures Downloader",
   "identifier": "com.yourteam.textures-downloader",
+  "mainBinaryName": "your-mod-textures-downloader",
   ...
 }
 ```
+
+`mainBinaryName` sets the executable's filename (without `.exe`). Keep it the same across releases
+so Windows users who extract a new version over the old folder don't end up with two executables.
 
 The `identifier` also determines where the app stores user settings. If you publish install
 instructions for your users, update the uninstall paths to match it.
