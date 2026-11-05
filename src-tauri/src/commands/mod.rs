@@ -2,6 +2,7 @@ pub mod app_info;
 mod chunking;
 pub mod filesystem;
 pub mod install;
+mod power;
 pub mod state;
 pub mod sync;
 

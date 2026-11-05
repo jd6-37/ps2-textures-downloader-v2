@@ -1,4 +1,5 @@
 use super::chunking::{self, Chunk};
+use super::power::KeepAwake;
 use crate::config::{
     CHUNK_MAX_ARG_CHARS, CHUNK_MAX_BLOBS, REPO_URL, SLUS_FOLDER, SPARSE_PATH, TEMP_DIR_NAME,
 };
@@ -109,7 +110,10 @@ fn get_git_path() -> Result<String, String> {
             return Ok("git".to_string());
         }
 
-        Err("Git not found. Please install Xcode Command Line Tools by running: xcode-select --install".to_string())
+        #[cfg(target_os = "macos")]
+        return Err("Git not found. Please install Xcode Command Line Tools by running: xcode-select --install".to_string());
+        #[cfg(not(target_os = "macos"))]
+        return Err("Git not found. Please install git with your distribution's package manager (for example: sudo apt install git)".to_string());
     }
 }
 
@@ -281,9 +285,9 @@ fn read_output_with_progress<R: IoRead>(
     }
 }
 
-/// Run a git command with PTY support (using script command on macOS/Linux)
-/// This ensures git outputs progress even when not connected to a real terminal
-/// Uses caffeinate to prevent system sleep during long operations
+/// Run a git command under a pseudo-terminal (via `script`) on macOS/Linux,
+/// so git prints progress as it would in a terminal. If `script` is missing,
+/// git runs directly: it still works, just with less progress output.
 /// When detect_stages is false, always uses default_stage instead of detecting from output
 /// percent_range maps git's progress into part of the overall bar (see scale_percent)
 /// Returns Ok(true) on success, Ok(false) on failure with error details, or Err on spawn failure
@@ -297,26 +301,39 @@ fn run_git_with_pty(
     detect_stages: bool,
     percent_range: Option<(u32, u32)>,
 ) -> Result<(bool, String), String> {
-    // Use 'caffeinate' to prevent sleep, 'script' to create a PTY for git
-    // caffeinate -d: prevent display sleep (also prevents screensaver)
-    // script -q /dev/null: create PTY without saving typescript
-    let mut cmd_args: Vec<&str> = vec!["-d", "script", "-q", "/dev/null", git_path];
-    cmd_args.extend(args);
-
-    let mut cmd = Command::new("caffeinate")
-        .args(&cmd_args)
+    // `script` sends everything (including git's stderr) to its stdout
+    let (mut cmd, via_pty) = match pty_command(git_path, args)
         .current_dir(working_dir)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed to start command: {}", e))?;
+    {
+        Ok(child) => (child, true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let child = Command::new(git_path)
+                .args(args)
+                .current_dir(working_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("Failed to start command: {}", e))?;
+            (child, false)
+        }
+        Err(e) => return Err(format!("Failed to start command: {}", e)),
+    };
 
     // Collect recent output for error reporting
     let recent_lines = Arc::new(Mutex::new(Vec::<String>::new()));
 
-    // script command outputs everything to stdout (including what would normally be stderr)
-    if let Some(stdout) = cmd.stdout.take() {
-        read_output_with_progress(stdout, window, default_stage, detect_stages, Some(recent_lines.clone()), percent_range);
+    let output: Option<Box<dyn IoRead>> = if via_pty {
+        cmd.stdout.take().map(|o| Box::new(o) as Box<dyn IoRead>)
+    } else {
+        cmd.stderr.take().map(|o| Box::new(o) as Box<dyn IoRead>)
+    };
+    if let Some(output) = output {
+        read_output_with_progress(output, window, default_stage, detect_stages, Some(recent_lines.clone()), percent_range);
     }
 
     let status = cmd
@@ -329,6 +346,32 @@ fn run_git_with_pty(
         .unwrap_or_default();
 
     Ok((status.success(), error_context))
+}
+
+/// `script` invocation that runs git under a pseudo-terminal without saving
+/// a transcript. The BSD (macOS) and util-linux versions take different
+/// arguments.
+#[cfg(target_os = "macos")]
+fn pty_command(git_path: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new("script");
+    cmd.args(["-q", "/dev/null", git_path]).args(args);
+    cmd
+}
+
+/// util-linux `script` takes the command as a single shell string, so every
+/// argument is single-quoted (folder names contain `&`, `(`, `)` and spaces).
+/// SHELL is pinned because `script` runs the string with the user's shell.
+/// `-e` passes git's exit code through.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pty_command(git_path: &str, args: &[&str]) -> Command {
+    let line = std::iter::once(git_path)
+        .chain(args.iter().copied())
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut cmd = Command::new("script");
+    cmd.args(["-q", "-e", "-c", &line, "/dev/null"]).env("SHELL", "/bin/sh");
+    cmd
 }
 
 /// Quote an argument for the ConPTY command line. Anything beyond a plain set
@@ -347,7 +390,6 @@ fn quote_arg(arg: &str) -> String {
 }
 
 /// Run a git command on Windows using ConPTY for proper progress output
-/// Uses SetThreadExecutionState to prevent system sleep during long operations
 /// When detect_stages is false, always uses default_stage instead of detecting from output
 /// percent_range maps git's progress into part of the overall bar (see scale_percent)
 /// Returns Ok((true, _)) on success, Ok((false, error_context)) on failure, or Err on spawn failure
@@ -363,12 +405,6 @@ fn run_git_with_pty(
 ) -> Result<(bool, String), String> {
     use conpty::spawn;
     use std::io::Read as _;
-    use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED};
-
-    // Prevent system sleep during the operation
-    unsafe {
-        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
-    }
 
     let working_dir_str = working_dir.to_string_lossy().to_string();
 
@@ -409,10 +445,7 @@ fn run_git_with_pty(
     // Spawn process using ConPTY (Windows Pseudo Console)
     // This makes git think it's connected to a real terminal
     let mut proc = spawn(&command_line)
-        .map_err(|e| {
-            unsafe { SetThreadExecutionState(ES_CONTINUOUS); }
-            format!("Failed to spawn process with ConPTY: {}", e)
-        })?;
+        .map_err(|e| format!("Failed to spawn process with ConPTY: {}", e))?;
 
     // Track the PID so we can kill it if the app closes
     let pid = proc.pid();
@@ -422,10 +455,9 @@ fn run_git_with_pty(
 
     // Read output from the PTY in a separate thread
     // This prevents blocking if the PTY doesn't send EOF properly
-    let output = proc.output().map_err(|e| {
-        unsafe { SetThreadExecutionState(ES_CONTINUOUS); }
-        format!("Failed to get process output: {}", e)
-    })?;
+    let output = proc
+        .output()
+        .map_err(|e| format!("Failed to get process output: {}", e))?;
 
     let window_clone = window.clone();
     let default_stage_owned = default_stage.to_string();
@@ -487,10 +519,9 @@ fn run_git_with_pty(
     });
 
     // Wait for process to exit (this returns even if reader is still running)
-    let exit_code = proc.wait(None).map_err(|e| {
-        unsafe { SetThreadExecutionState(ES_CONTINUOUS); }
-        format!("Failed to wait for process: {}", e)
-    })?;
+    let exit_code = proc
+        .wait(None)
+        .map_err(|e| format!("Failed to wait for process: {}", e))?;
 
     // Remove PID from tracking list
     if let Ok(mut pids) = RUNNING_PIDS.lock() {
@@ -508,11 +539,6 @@ fn run_git_with_pty(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     // Don't call join() - if thread is stuck, let it be orphaned
-
-    // Restore normal sleep behavior
-    unsafe {
-        SetThreadExecutionState(ES_CONTINUOUS);
-    }
 
     // Get recent output for error message
     let mut error_context = recent_lines.lock()
@@ -656,7 +682,8 @@ fn clone_repository(git_path: &str, temp_path: &PathBuf, window: &Window) -> Res
 }
 
 /// Delays between attempts at one download step; one more attempt than entries
-const RETRY_DELAYS_SECS: [u64; 2] = [5, 20];
+/// (long enough for a laptop's network to reconnect after waking)
+const RETRY_DELAYS_SECS: [u64; 3] = [10, 30, 60];
 
 /// Run a download step, retrying after a dropped connection. A failed step
 /// changes nothing (git rolls back the sparse patterns), and blobs from
@@ -724,6 +751,9 @@ pub async fn start_installation(textures_dir: String, window: Window) -> Result<
     let textures_path = PathBuf::from(&textures_dir);
     let temp_path = textures_path.join(TEMP_DIR_NAME);
     let final_path = textures_path.join(SLUS_FOLDER);
+
+    // Idle sleep drops the connection mid-download
+    let _awake = KeepAwake::new("Downloading textures");
 
     // Emit initial progress
     let _ = window.emit(

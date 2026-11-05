@@ -1,3 +1,4 @@
+use super::power::KeepAwake;
 use crate::config::{REPO_NAME, REPO_OWNER, SLUS_FOLDER, SPARSE_PATH};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -1244,6 +1245,9 @@ pub async fn apply_verification_fixes(
     github_token: Option<String>,
     window: Window,
 ) -> Result<(u32, u32), String> {
+    // Idle sleep drops the connection mid-download
+    let _awake = KeepAwake::new("Syncing textures");
+
     let textures_path = PathBuf::from(&textures_dir);
     let slus_path = textures_path.join(SLUS_FOLDER);
     let client = Client::new();
@@ -1339,6 +1343,9 @@ pub async fn run_sync(
     full_sync: bool,
     window: Window,
 ) -> Result<SyncResult, String> {
+    // Idle sleep drops the connection mid-download
+    let _awake = KeepAwake::new("Syncing textures");
+
     let result = if full_sync || last_sync_commit.is_none() {
         run_full_sync(&textures_dir, &github_token, &window).await?
     } else {
@@ -1484,6 +1491,9 @@ pub async fn analyze_full_sync(
     github_token: Option<String>,
     window: Window,
 ) -> Result<SyncAnalysis, String> {
+    // Idle sleep drops the connection mid-download
+    let _awake = KeepAwake::new("Syncing textures");
+
     let textures_path = PathBuf::from(&textures_dir);
     let slus_path = textures_path.join(SLUS_FOLDER);
 
@@ -1641,6 +1651,9 @@ pub async fn execute_analyzed_sync(
     github_token: Option<String>,
     window: Window,
 ) -> Result<SyncResult, String> {
+    // Idle sleep drops the connection mid-download
+    let _awake = KeepAwake::new("Syncing textures");
+
     let textures_path = PathBuf::from(&textures_dir);
     let slus_path = textures_path.join(SLUS_FOLDER);
 
