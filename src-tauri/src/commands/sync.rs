@@ -680,6 +680,27 @@ fn remove_synced_file(slus_path: &Path, local_path: &Path) -> Result<(), String>
     Ok(())
 }
 
+/// Whether two existing paths name the same file, e.g. spellings differing
+/// only in case on a case-insensitive filesystem. False if either is missing.
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // canonicalize resolves to the on-disk spelling of the path
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(ca), Ok(cb)) => ca == cb,
+            _ => false,
+        }
+    }
+}
+
 /// Check if a local file exists (either normal or disabled version)
 /// Returns (exists, is_disabled, actual_path)
 fn find_local_file(slus_path: &Path, relative_path: &str) -> (bool, bool, PathBuf) {
@@ -780,7 +801,8 @@ async fn run_incremental_sync(
     // Old copies of files whose replacement is being downloaded. Removed only
     // once the downloads succeed, so a failure never loses a file (or, for a
     // disabled texture, the user's choice to disable it).
-    let mut replaced: Vec<(String, PathBuf)> = Vec::new();
+    // (relative path, old local path, download destination)
+    let mut replaced: Vec<(String, PathBuf, PathBuf)> = Vec::new();
 
     for (i, file) in relevant_files.iter().enumerate() {
         let old_rel_path = file.previous_filename.as_deref().and_then(syncable);
@@ -870,7 +892,11 @@ async fn run_incremental_sync(
                                 let _ = fs::remove_dir(parent);
                             }
                         } else {
-                            replaced.push((relative_path.clone(), old_local_path));
+                            replaced.push((
+                                relative_path.clone(),
+                                old_local_path,
+                                new_local_path.clone(),
+                            ));
                             downloads.push(DownloadJob {
                                 path: relative_path,
                                 dest: new_local_path,
@@ -905,8 +931,10 @@ async fn run_incremental_sync(
     .await?;
 
     // Replacements are in place: remove the old copies they superseded
-    for (relative_path, old_local_path) in replaced {
-        if old_local_path.exists() {
+    for (relative_path, old_local_path, new_local_path) in replaced {
+        // On a case-insensitive filesystem a case-only rename makes the old
+        // path another spelling of the file just downloaded: keep it
+        if old_local_path.exists() && !is_same_file(&old_local_path, &new_local_path) {
             remove_synced_file(&slus_path, &old_local_path)
                 .map_err(|e| format!("Failed to remove the old copy of {}: {}", relative_path, e))?;
         }
