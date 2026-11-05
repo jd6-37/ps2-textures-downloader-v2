@@ -125,6 +125,26 @@ fn git_blob_sha(path: &Path) -> Option<String> {
     Some(hex::encode(hasher.finalize()))
 }
 
+/// Whether two paths refer to the same file on disk. Copying a file onto
+/// itself truncates it, so this has to recognise aliases (case differences on
+/// case-insensitive filesystems, links), not just identical path strings.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 /// How many files download at once. Each raw download spends most of its
 /// time waiting for the server to start responding, so running several at
 /// once is what makes large downloads fast. Higher values stop helping once
@@ -186,6 +206,12 @@ pub(crate) async fn download_files(
             && first.sha.as_deref().is_some()
             && git_blob_sha(&first.dest).as_deref() == first.sha.as_deref();
         for copy in rest {
+            // Two jobs can resolve to the same local file; it already holds
+            // the downloaded content, and copying it onto itself would
+            // truncate it
+            if same_file(&first.dest, &copy.dest) {
+                continue;
+            }
             if verified {
                 if let Some(parent) = copy.dest.parent() {
                     fs::create_dir_all(parent)
