@@ -43,6 +43,8 @@ struct Node {
     children: BTreeMap<String, Node>,
     /// Unique blob ids anywhere under this directory.
     blobs: HashSet<u32>,
+    /// Unique blob ids of files directly in this directory.
+    direct: HashSet<u32>,
 }
 
 /// Plan chunks for everything under `root`.
@@ -52,7 +54,8 @@ struct Node {
 /// until adding the next one would exceed `max_blobs` or `max_chars` (the
 /// command-line budget for the directory arguments). Files sitting directly
 /// in a split directory are fetched with its first subdirectory, because cone
-/// mode includes the files of every parent of an included directory.
+/// mode includes the files of every parent of an included directory, so they
+/// are counted towards that subdirectory's chunk.
 ///
 /// A directory that cannot be split (no subdirectories) becomes a chunk on
 /// its own regardless of size.
@@ -81,14 +84,21 @@ pub fn plan_chunks(
             node = node.children.entry(part.to_string()).or_default();
             node.blobs.insert(id);
         }
+        node.direct.insert(id);
     }
 
     if tree.blobs.is_empty() {
         return Vec::new();
     }
 
-    let mut units: Vec<(String, &HashSet<u32>)> = Vec::new();
-    collect_units(&tree, root.trim_end_matches('/').to_string(), max_blobs, &mut units);
+    let mut units: Vec<(String, HashSet<u32>)> = Vec::new();
+    collect_units(
+        &tree,
+        root.trim_end_matches('/').to_string(),
+        max_blobs,
+        &mut HashSet::new(),
+        &mut units,
+    );
 
     let mut chunks = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
@@ -116,18 +126,24 @@ pub fn plan_chunks(
     chunks
 }
 
-fn collect_units<'a>(
-    node: &'a Node,
+/// `inherited` holds files directly in split ancestors that no unit has
+/// claimed yet; the next unit emitted is the one cone mode fetches them with.
+fn collect_units(
+    node: &Node,
     path: String,
     max_blobs: usize,
-    units: &mut Vec<(String, &'a HashSet<u32>)>,
+    inherited: &mut HashSet<u32>,
+    units: &mut Vec<(String, HashSet<u32>)>,
 ) {
     if node.blobs.len() <= max_blobs || node.children.is_empty() {
-        units.push((path, &node.blobs));
+        let mut blobs = node.blobs.clone();
+        blobs.extend(inherited.drain());
+        units.push((path, blobs));
         return;
     }
+    inherited.extend(node.direct.iter().copied());
     for (name, child) in &node.children {
-        collect_units(child, format!("{}/{}", path, name), max_blobs, units);
+        collect_units(child, format!("{}/{}", path, name), max_blobs, inherited, units);
     }
 }
 
@@ -195,6 +211,28 @@ mod tests {
             vec![
                 Chunk { dirs: vec!["root/teams/a".into(), "root/teams/b".into()], blobs: 2 },
                 Chunk { dirs: vec!["root/teams/c".into()], blobs: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn files_in_split_directories_count_towards_first_subdirectory() {
+        // "root" and "root/big" are split; their own files are fetched with
+        // the first unit beneath them, root/big/x.
+        let f = files(&[
+            ("root/top.png", "t"),
+            ("root/big/loose.png", "l"),
+            ("root/big/x/1.png", "1"),
+            ("root/big/y/2.png", "2"),
+            ("root/big/y/3.png", "3"),
+            ("root/small/4.png", "4"),
+        ]);
+        let chunks = plan_chunks("root", &f, 3, 1000);
+        assert_eq!(
+            chunks,
+            vec![
+                Chunk { dirs: vec!["root/big/x".into()], blobs: 3 },
+                Chunk { dirs: vec!["root/big/y".into(), "root/small".into()], blobs: 3 },
             ]
         );
     }
