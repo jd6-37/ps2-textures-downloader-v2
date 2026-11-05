@@ -1,4 +1,4 @@
-use super::download::{download_files, http_client, DownloadJob};
+use super::download::{download_files, http_client, should_skip_path, DownloadJob};
 use super::power::KeepAwake;
 use crate::config::{user_agent, REPO_NAME, REPO_OWNER, SLUS_FOLDER, SPARSE_PATH};
 use reqwest::Client;
@@ -240,10 +240,16 @@ fn cleanup_empty_directories_recursive(dir: &Path, is_root: bool, window: &Windo
         }
     };
 
-    // First, recurse into subdirectories
+    // First, recurse into subdirectories. Protected folders (user-customs,
+    // hidden folders) are never entered: nothing inside them is deleted, and
+    // they are never removed even when empty.
     for entry in &entries {
         let path = entry.path();
-        if path.is_dir() {
+        let protected = entry
+            .file_name()
+            .to_str()
+            .map_or(true, |name| should_skip_path(name));
+        if path.is_dir() && !protected {
             removed += cleanup_empty_directories_recursive(&path, false, window);
         }
     }
@@ -292,20 +298,6 @@ fn cleanup_empty_directories_recursive(dir: &Path, is_root: bool, window: &Windo
     removed
 }
 
-/// Check if a path should be skipped (user-customs folder or hidden files)
-fn should_skip_path(path: &str) -> bool {
-    // Skip user-customs folder
-    if path.contains("user-customs") {
-        return true;
-    }
-    // Skip hidden files/directories (starting with .)
-    for component in path.split('/') {
-        if component.starts_with('.') {
-            return true;
-        }
-    }
-    false
-}
 
 /// Check if a filename is a disabled (dash-prefixed) version
 fn is_disabled_filename(filename: &str) -> bool {
@@ -663,6 +655,31 @@ fn build_local_file_map_recursive(
     Ok(())
 }
 
+/// Refuse to act on a protected local path (anything under a user-customs
+/// folder, or hidden). The lists the sync works from already exclude these;
+/// this is the backstop, so a mistake there fails instead of touching the
+/// user's files.
+fn ensure_unprotected(slus_path: &Path, local_path: &Path) -> Result<(), String> {
+    let relative = local_path.strip_prefix(slus_path).unwrap_or(local_path);
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    if should_skip_path(&relative) {
+        return Err(format!("Refusing to modify protected path: {}", relative));
+    }
+    Ok(())
+}
+
+/// Delete a synced file (after checking it isn't protected), then its
+/// parent folder if that is now empty
+fn remove_synced_file(slus_path: &Path, local_path: &Path) -> Result<(), String> {
+    ensure_unprotected(slus_path, local_path)?;
+    fs::remove_file(local_path)
+        .map_err(|e| format!("Failed to delete {}: {}", local_path.display(), e))?;
+    if let Some(parent) = local_path.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+    Ok(())
+}
+
 /// Check if a local file exists (either normal or disabled version)
 /// Returns (exists, is_disabled, actual_path)
 fn find_local_file(slus_path: &Path, relative_path: &str) -> (bool, bool, PathBuf) {
@@ -724,15 +741,24 @@ async fn run_incremental_sync(
         return Err("TRUNCATED: Too many changed files, falling back to full sync".to_string());
     }
 
-    // Filter to only files in our sparse path
+    // Path relative to the texture folder, for repository paths the sync may
+    // act on: inside the texture folder and not protected (user-customs,
+    // hidden files)
     let prefix = format!("{}/", SPARSE_PATH);
+    let syncable = |path: &str| -> Option<String> {
+        path.strip_prefix(&prefix)
+            .filter(|_| !should_skip_path(path))
+            .map(str::to_string)
+    };
+
+    // Changes the sync acts on. A rename counts if either end is syncable:
+    // renamed out (or into a protected folder) leaves an old copy to remove,
+    // renamed in (or out of a protected folder) brings a new file.
     let relevant_files: Vec<CompareFile> = changed_files
         .into_iter()
         .filter(|f| {
-            let in_folder = |path: &str| path.starts_with(&prefix) && !should_skip_path(path);
-            // A file renamed out of the texture folder still has a local copy to remove
-            in_folder(&f.filename)
-                || (f.status == "renamed" && f.previous_filename.as_deref().map_or(false, in_folder))
+            syncable(&f.filename).is_some()
+                || (f.status == "renamed" && f.previous_filename.as_deref().and_then(syncable).is_some())
         })
         .collect();
 
@@ -749,23 +775,24 @@ async fn run_incremental_sync(
     let mut skipped: u32 = 0;
 
     // Renames and deletions happen here, in order; downloads are collected
-    // and run in parallel afterwards. Doing them last also means a file added
-    // at a path another file was renamed away from can't be moved by mistake.
+    // and run in parallel afterwards.
     let mut downloads: Vec<DownloadJob> = Vec::new();
+    // Old copies of files whose replacement is being downloaded. Removed only
+    // once the downloads succeed, so a failure never loses a file (or, for a
+    // disabled texture, the user's choice to disable it).
+    let mut replaced: Vec<(String, PathBuf)> = Vec::new();
 
     for (i, file) in relevant_files.iter().enumerate() {
-        let Some(relative_path) = file.filename.strip_prefix(&prefix).map(str::to_string) else {
-            // Renamed out of the texture folder: remove the old local copy
-            let old_rel_path = file.previous_filename.as_deref().and_then(|p| p.strip_prefix(&prefix));
+        let old_rel_path = file.previous_filename.as_deref().and_then(syncable);
+
+        let Some(relative_path) = syncable(&file.filename) else {
+            // Renamed out of the texture folder, or into a protected folder:
+            // only the old copy is ours to remove
             if let Some(old_rel_path) = old_rel_path {
-                let (exists, _, old_local_path) = find_local_file(&slus_path, old_rel_path);
+                let (exists, _, old_local_path) = find_local_file(&slus_path, &old_rel_path);
                 if exists {
-                    fs::remove_file(&old_local_path)
-                        .map_err(|e| format!("Failed to delete {}: {}", old_rel_path, e))?;
+                    remove_synced_file(&slus_path, &old_local_path)?;
                     deleted += 1;
-                    if let Some(parent) = old_local_path.parent() {
-                        let _ = fs::remove_dir(parent);
-                    }
                 }
             }
             continue;
@@ -799,23 +826,15 @@ async fn run_incremental_sync(
                 // Delete the file (check both normal and disabled versions)
                 let (exists, _, local_path) = find_local_file(&slus_path, &relative_path);
                 if exists {
-                    fs::remove_file(&local_path)
-                        .map_err(|e| format!("Failed to delete {}: {}", relative_path, e))?;
+                    remove_synced_file(&slus_path, &local_path)?;
                     deleted += 1;
-
-                    // Try to remove empty parent directories
-                    if let Some(parent) = local_path.parent() {
-                        let _ = fs::remove_dir(parent);
-                    }
                 }
             }
             "renamed" => {
-                // The old file's local copy, if it was inside the texture folder
-                let old_local = file
-                    .previous_filename
-                    .as_deref()
-                    .and_then(|p| p.strip_prefix(&prefix))
-                    .map(|old_rel_path| find_local_file(&slus_path, old_rel_path))
+                // The old file's local copy, unless it was outside the texture
+                // folder or in a protected one (then it stays where it is)
+                let old_local = old_rel_path
+                    .map(|old_rel_path| find_local_file(&slus_path, &old_rel_path))
                     .filter(|(exists, _, _)| *exists);
 
                 match old_local {
@@ -836,6 +855,8 @@ async fn run_incremental_sync(
                         });
 
                         if unchanged {
+                            ensure_unprotected(&slus_path, &old_local_path)?;
+                            ensure_unprotected(&slus_path, &new_local_path)?;
                             if let Some(parent) = new_local_path.parent() {
                                 fs::create_dir_all(parent)
                                     .map_err(|e| format!("Failed to create directory: {}", e))?;
@@ -843,24 +864,22 @@ async fn run_incremental_sync(
                             fs::rename(&old_local_path, &new_local_path)
                                 .map_err(|e| format!("Failed to rename {}: {}", relative_path, e))?;
                             renamed += 1;
+
+                            // Try to remove empty old parent directories
+                            if let Some(parent) = old_local_path.parent() {
+                                let _ = fs::remove_dir(parent);
+                            }
                         } else {
-                            fs::remove_file(&old_local_path)
-                                .map_err(|e| format!("Failed to delete {}: {}", relative_path, e))?;
+                            replaced.push((relative_path.clone(), old_local_path));
                             downloads.push(DownloadJob {
                                 path: relative_path,
                                 dest: new_local_path,
                                 sha: file.sha.clone(),
                             });
                         }
-
-                        // Try to remove empty old parent directories
-                        if let Some(parent) = old_local_path.parent() {
-                            let _ = fs::remove_dir(parent);
-                        }
                     }
                     None => {
-                        // No local copy to move (missing, or renamed in from outside the
-                        // texture folder): download the new file
+                        // No local copy to move: download the new file
                         downloads.push(DownloadJob {
                             dest: slus_path.join(&relative_path),
                             path: relative_path,
@@ -884,6 +903,14 @@ async fn run_incremental_sync(
         });
     })
     .await?;
+
+    // Replacements are in place: remove the old copies they superseded
+    for (relative_path, old_local_path) in replaced {
+        if old_local_path.exists() {
+            remove_synced_file(&slus_path, &old_local_path)
+                .map_err(|e| format!("Failed to remove the old copy of {}: {}", relative_path, e))?;
+        }
+    }
 
     let _ = window.emit("sync-progress", SyncProgressPayload {
         stage: "complete".to_string(),
@@ -1089,13 +1116,8 @@ async fn run_full_sync(
 
         let file_path = slus_path.join(path);
         if file_path.exists() {
-            fs::remove_file(&file_path)
-                .map_err(|e| format!("Failed to delete {}: {}", path, e))?;
+            remove_synced_file(&slus_path, &file_path)?;
             deleted += 1;
-
-            if let Some(parent) = file_path.parent() {
-                let _ = fs::remove_dir(parent);
-            }
         }
     }
 
@@ -1320,13 +1342,8 @@ pub async fn apply_verification_fixes(
 
             let file_path = slus_path.join(path);
             if file_path.exists() {
-                fs::remove_file(&file_path)
-                    .map_err(|e| format!("Failed to delete {}: {}", path, e))?;
+                remove_synced_file(&slus_path, &file_path)?;
                 deleted += 1;
-
-                if let Some(parent) = file_path.parent() {
-                    let _ = fs::remove_dir(parent);
-                }
             }
         }
     }
@@ -1732,8 +1749,7 @@ pub async fn execute_analyzed_sync(
 
         let file_path = slus_path.join(path);
         if file_path.exists() {
-            fs::remove_file(&file_path)
-                .map_err(|e| format!("Failed to delete {}: {}", path, e))?;
+            remove_synced_file(&slus_path, &file_path)?;
             deleted += 1;
         }
     }

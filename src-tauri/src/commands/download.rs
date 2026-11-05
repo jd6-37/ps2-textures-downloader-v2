@@ -9,6 +9,7 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use sha1::{Digest, Sha1};
 use std::time::Duration;
 
 /// HTTP client for sync requests. Without timeouts a stalled connection
@@ -98,6 +99,32 @@ async fn download_file_once(
     Ok(())
 }
 
+/// Whether a path is protected from sync: anything in a user-customs folder
+/// (the user's own textures, which the app must never touch) and hidden
+/// files or folders
+pub(crate) fn should_skip_path(path: &str) -> bool {
+    // Skip user-customs folder
+    if path.contains("user-customs") {
+        return true;
+    }
+    // Skip hidden files/directories (starting with .)
+    for component in path.split('/') {
+        if component.starts_with('.') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Git blob id of a file on disk
+fn git_blob_sha(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {}\0", data.len()).as_bytes());
+    hasher.update(&data);
+    Some(hex::encode(hasher.finalize()))
+}
+
 /// How many files download at once. Each raw download spends most of its
 /// time waiting for the server to start responding, so running several at
 /// once is what makes large downloads fast. Higher values stop helping once
@@ -143,15 +170,32 @@ pub(crate) async fn download_files(
     }
 
     let mut transfers = stream::iter(groups.into_iter().map(|group| async move {
+        // Backstop: the job lists already exclude protected paths
+        if let Some(job) = group.iter().find(|job| should_skip_path(&job.path)) {
+            return Err(format!("Refusing to write protected path: {}", job.path));
+        }
+
         let first = &group[0];
         download_file(client, &first.path, &first.dest, token).await?;
-        for copy in &group[1..] {
-            if let Some(parent) = copy.dest.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create directory: {}", e))?;
+
+        // Copies are only safe if the download has the content the jobs were
+        // planned for; if the repository changed in between, each path is
+        // downloaded on its own instead
+        let rest = &group[1..];
+        let verified = !rest.is_empty()
+            && first.sha.as_deref().is_some()
+            && git_blob_sha(&first.dest).as_deref() == first.sha.as_deref();
+        for copy in rest {
+            if verified {
+                if let Some(parent) = copy.dest.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("Failed to create directory: {}", e))?;
+                }
+                fs::copy(&first.dest, &copy.dest)
+                    .map_err(|e| format!("Failed to copy {} to {}: {}", first.path, copy.path, e))?;
+            } else {
+                download_file(client, &copy.path, &copy.dest, token).await?;
             }
-            fs::copy(&first.dest, &copy.dest)
-                .map_err(|e| format!("Failed to copy {} to {}: {}", first.path, copy.path, e))?;
         }
         Ok::<_, String>(group)
     }))
