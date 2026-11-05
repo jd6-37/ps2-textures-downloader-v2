@@ -608,6 +608,15 @@ fn resumable_listing(git_path: &str, repo: &PathBuf) -> Option<Vec<u8>> {
         return None;
     }
     clear_stale_git_files(repo);
+    // A clone killed after recording the commit but before writing its index
+    // passes the checks above, but sparse-checkout then has no entries to
+    // check out and silently produces nothing
+    let indexed = git_capture(git_path, repo, &["ls-files", "--", SPARSE_PATH])
+        .map(|out| !out.is_empty())
+        .unwrap_or(false);
+    if !indexed {
+        return None;
+    }
     list_textures(git_path, repo).ok().filter(|listing| !listing.is_empty())
 }
 
