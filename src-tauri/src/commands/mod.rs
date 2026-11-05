@@ -1,4 +1,5 @@
 pub mod app_info;
+mod chunking;
 pub mod filesystem;
 pub mod install;
 pub mod state;

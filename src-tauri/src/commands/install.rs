@@ -1,4 +1,7 @@
-use crate::config::{REPO_URL, SLUS_FOLDER, SPARSE_PATH, TEMP_DIR_NAME};
+use super::chunking::{self, Chunk};
+use crate::config::{
+    CHUNK_MAX_ARG_CHARS, CHUNK_MAX_BLOBS, REPO_URL, SLUS_FOLDER, SPARSE_PATH, TEMP_DIR_NAME,
+};
 use regex::Regex;
 use serde::Serialize;
 use std::io::{BufReader, Read as IoRead};
@@ -9,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::process::Command;
 use std::fs;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{Emitter, Window};
 
 // Track running process PIDs so we can kill them on app exit
@@ -164,6 +168,19 @@ fn detect_git_stage(line: &str) -> (Option<&'static str>, Option<u32>) {
     (None, percent)
 }
 
+/// Map a git progress percentage into a slice of the overall progress bar.
+/// Without a range the raw percentage is used. With one, only "Receiving
+/// objects" moves the bar, so per-chunk counters don't make it jump around.
+fn scale_percent(line: &str, percent: Option<u32>, range: Option<(u32, u32)>) -> Option<u32> {
+    match range {
+        None => percent,
+        Some((lo, hi)) if line.contains("Receiving objects:") => {
+            percent.map(|p| lo + hi.saturating_sub(lo) * p.min(100) / 100)
+        }
+        Some(_) => None,
+    }
+}
+
 /// Read output handling both \r and \n as line terminators
 /// Git uses \r to update progress on the same line
 /// When detect_stages is false, always uses default_stage
@@ -173,7 +190,8 @@ fn read_output_with_progress<R: IoRead>(
     window: &Window,
     default_stage: &str,
     detect_stages: bool,
-    recent_lines: Option<Arc<Mutex<Vec<String>>>>
+    recent_lines: Option<Arc<Mutex<Vec<String>>>>,
+    percent_range: Option<(u32, u32)>,
 ) {
     let mut buf_reader = BufReader::new(reader);
     let mut buffer = Vec::new();
@@ -200,6 +218,7 @@ fn read_output_with_progress<R: IoRead>(
                                 }
 
                                 let (detected_stage, percent) = detect_git_stage(&line);
+                                let percent = scale_percent(&line, percent, percent_range);
                                 let stage = if detect_stages {
                                     detected_stage.unwrap_or(default_stage)
                                 } else {
@@ -242,6 +261,7 @@ fn read_output_with_progress<R: IoRead>(
                 }
 
                 let (detected_stage, percent) = detect_git_stage(&line);
+                let percent = scale_percent(&line, percent, percent_range);
                 let stage = if detect_stages {
                     detected_stage.unwrap_or(default_stage)
                 } else {
@@ -265,6 +285,7 @@ fn read_output_with_progress<R: IoRead>(
 /// This ensures git outputs progress even when not connected to a real terminal
 /// Uses caffeinate to prevent system sleep during long operations
 /// When detect_stages is false, always uses default_stage instead of detecting from output
+/// percent_range maps git's progress into part of the overall bar (see scale_percent)
 /// Returns Ok(true) on success, Ok(false) on failure with error details, or Err on spawn failure
 #[cfg(not(target_os = "windows"))]
 fn run_git_with_pty(
@@ -274,6 +295,7 @@ fn run_git_with_pty(
     window: &Window,
     default_stage: &str,
     detect_stages: bool,
+    percent_range: Option<(u32, u32)>,
 ) -> Result<(bool, String), String> {
     // Use 'caffeinate' to prevent sleep, 'script' to create a PTY for git
     // caffeinate -d: prevent display sleep (also prevents screensaver)
@@ -294,7 +316,7 @@ fn run_git_with_pty(
 
     // script command outputs everything to stdout (including what would normally be stderr)
     if let Some(stdout) = cmd.stdout.take() {
-        read_output_with_progress(stdout, window, default_stage, detect_stages, Some(recent_lines.clone()));
+        read_output_with_progress(stdout, window, default_stage, detect_stages, Some(recent_lines.clone()), percent_range);
     }
 
     let status = cmd
@@ -309,9 +331,25 @@ fn run_git_with_pty(
     Ok((status.success(), error_context))
 }
 
+/// Quote an argument for the ConPTY command line. Anything beyond a plain set
+/// of characters is quoted, since the command may run through `cmd.exe /c`,
+/// where unquoted `&`, `(` and `)` (common in texture folder names) are
+/// operators. Paths never contain `"` on Windows.
+#[cfg(target_os = "windows")]
+fn quote_arg(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@+".contains(c));
+    if plain {
+        arg.to_string()
+    } else {
+        format!("\"{}\"", arg)
+    }
+}
+
 /// Run a git command on Windows using ConPTY for proper progress output
 /// Uses SetThreadExecutionState to prevent system sleep during long operations
 /// When detect_stages is false, always uses default_stage instead of detecting from output
+/// percent_range maps git's progress into part of the overall bar (see scale_percent)
 /// Returns Ok((true, _)) on success, Ok((false, error_context)) on failure, or Err on spawn failure
 #[cfg(target_os = "windows")]
 fn run_git_with_pty(
@@ -321,6 +359,7 @@ fn run_git_with_pty(
     window: &Window,
     default_stage: &str,
     detect_stages: bool,
+    percent_range: Option<(u32, u32)>,
 ) -> Result<(bool, String), String> {
     use conpty::spawn;
     use std::io::Read as _;
@@ -343,10 +382,8 @@ fn run_git_with_pty(
         args.iter().map(|arg| {
             if *arg == "." {
                 format!("\"{}\"", working_dir_str)
-            } else if arg.contains(' ') {
-                format!("\"{}\"", arg)
             } else {
-                arg.to_string()
+                quote_arg(arg)
             }
         }).collect()
     } else {
@@ -356,11 +393,7 @@ fn run_git_with_pty(
             format!("\"{}\"", working_dir_str),
         ];
         for arg in args {
-            if arg.contains(' ') {
-                v.push(format!("\"{}\"", arg));
-            } else {
-                v.push(arg.to_string());
-            }
+            v.push(quote_arg(arg));
         }
         v
     };
@@ -425,6 +458,7 @@ fn run_git_with_pty(
                                     }
 
                                     let (detected_stage, percent) = detect_git_stage(&line);
+                                    let percent = scale_percent(&line, percent, percent_range);
                                     let stage = if detect_stages {
                                         detected_stage.unwrap_or(&default_stage_owned)
                                     } else {
@@ -494,9 +528,198 @@ fn run_git_with_pty(
     Ok((exit_code == 0, error_context))
 }
 
+/// Emit an install progress event
+fn emit_progress(window: &Window, stage: &str, message: &str, percent: Option<u32>) {
+    let _ = window.emit(
+        "install-progress",
+        ProgressPayload {
+            stage: stage.to_string(),
+            message: message.to_string(),
+            percent,
+        },
+    );
+}
+
+/// Run git without a PTY and capture stdout. Ok only when git succeeds.
+fn git_capture(git_path: &str, working_dir: &PathBuf, args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut cmd = Command::new(git_path);
+    cmd.arg("-C").arg(working_dir).args(args);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().map_err(|e| format!("Failed to run git: {}", e))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// List every file under SPARSE_PATH with its blob id. Reads only tree
+/// objects, which the partial clone already has, so nothing is downloaded.
+fn list_textures(git_path: &str, repo: &PathBuf) -> Result<Vec<u8>, String> {
+    git_capture(git_path, repo, &["ls-tree", "-r", "-z", "HEAD", "--", SPARSE_PATH])
+}
+
+/// If `repo` holds an interrupted install of this project, clean up after
+/// any killed git process and return its file listing. Anything unexpected
+/// means "not resumable", and the caller starts over with a fresh clone.
+fn resumable_listing(git_path: &str, repo: &PathBuf) -> Option<Vec<u8>> {
+    if !repo.join(".git").is_dir() {
+        return None;
+    }
+    let config = |key: &str| {
+        git_capture(git_path, repo, &["config", "--get", key])
+            .ok()
+            .map(|out| String::from_utf8_lossy(&out).trim().to_string())
+    };
+    if config("remote.origin.url").as_deref() != Some(REPO_URL)
+        || config("core.sparseCheckout").as_deref() != Some("true")
+    {
+        return None;
+    }
+    clear_stale_git_files(repo);
+    list_textures(git_path, repo).ok().filter(|listing| !listing.is_empty())
+}
+
+/// Remove what a killed git process leaves behind: lock files that make
+/// every later command fail, and partial pack downloads that can be
+/// gigabytes. Only called while no git process is running in this clone.
+fn clear_stale_git_files(repo: &PathBuf) {
+    let git_dir = repo.join(".git");
+    let _ = fs::remove_file(git_dir.join("index.lock"));
+    let _ = fs::remove_file(git_dir.join("shallow.lock"));
+    let _ = fs::remove_file(git_dir.join("info").join("sparse-checkout.lock"));
+    if let Ok(entries) = fs::read_dir(git_dir.join("objects").join("pack")) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("tmp_") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Fresh metadata-only clone into `temp_path`, replacing anything there
+fn clone_repository(git_path: &str, temp_path: &PathBuf, window: &Window) -> Result<(), String> {
+    if temp_path.exists() {
+        fs::remove_dir_all(temp_path)
+            .map_err(|e| format!("Failed to clean temp directory: {}", e))?;
+    }
+
+    // Create temp directory (only on macOS - on Windows, git clone will create it)
+    #[cfg(not(target_os = "windows"))]
+    fs::create_dir_all(temp_path)
+        .map_err(|e| format!("Failed to create temp directory: {}", e))?;
+
+    // Stage 1: Clone with sparse checkout (this is quick - just metadata)
+    let _ = window.emit(
+        "install-progress",
+        ProgressPayload {
+            stage: "cloning".to_string(),
+            message: "Initializing repository...".to_string(),
+            percent: Some(0),
+        },
+    );
+
+    let (clone_success, clone_output) = run_git_with_pty(
+        git_path,
+        &[
+            "clone",
+            "--depth=1",
+            "--filter=blob:none",
+            "--sparse",
+            "--progress",
+            REPO_URL,
+            ".",
+        ],
+        temp_path,
+        window,
+        "cloning",
+        false, // Don't detect stages - keep showing "Initializing repository..."
+        None,
+    )?;
+
+    if !clone_success {
+        let _ = fs::remove_dir_all(temp_path);
+        let error_msg = if clone_output.is_empty() {
+            "Git clone has failed. Please check your internet connection.".to_string()
+        } else {
+            format!("Git clone has failed:\n{}", clone_output)
+        };
+        return Err(error_msg);
+    }
+
+    Ok(())
+}
+
+/// Delays between attempts at one download step; one more attempt than entries
+const RETRY_DELAYS_SECS: [u64; 2] = [5, 20];
+
+/// Run a download step, retrying after a dropped connection. A failed step
+/// changes nothing (git rolls back the sparse patterns), and blobs from
+/// earlier steps stay on disk, so a retry only repeats this step.
+fn run_git_with_retries(
+    git_path: &str,
+    args: &[&str],
+    repo: &PathBuf,
+    window: &Window,
+    percent_range: Option<(u32, u32)>,
+    what: &str,
+) -> Result<(), String> {
+    let mut attempt = 0;
+    loop {
+        clear_stale_git_files(repo);
+        let (success, output) =
+            run_git_with_pty(git_path, args, repo, window, "downloading", false, percent_range)?;
+        if success {
+            return Ok(());
+        }
+        let Some(&delay) = RETRY_DELAYS_SECS.get(attempt) else {
+            return Err(output);
+        };
+        attempt += 1;
+        emit_progress(
+            window,
+            "downloading",
+            &format!(
+                "Connection interrupted while downloading {}. Retrying in {}s (attempt {} of {})...",
+                what,
+                delay,
+                attempt + 1,
+                RETRY_DELAYS_SECS.len() + 1
+            ),
+            None,
+        );
+        std::thread::sleep(Duration::from_secs(delay));
+    }
+}
+
+/// Short label for a chunk: its first folder (relative to SPARSE_PATH)
+fn describe_chunk(chunk: &Chunk) -> String {
+    let prefix = format!("{}/", SPARSE_PATH);
+    let first = chunk.dirs.first().map(String::as_str).unwrap_or(SPARSE_PATH);
+    let first = first.strip_prefix(&prefix).unwrap_or(first);
+    match chunk.dirs.len() {
+        0 | 1 => first.to_string(),
+        n => format!("{} and {} more folder{}", first, n - 1, if n == 2 { "" } else { "s" }),
+    }
+}
+
+fn interrupted_message(parts_done: usize, total_parts: usize, output: &str) -> String {
+    format!(
+        "Download interrupted after {} of {} parts. The completed parts have been kept: \
+         click Start Installation again to resume where it left off.\n\n{}",
+        parts_done, total_parts, output
+    )
+}
+
 /// Run the git sparse checkout installation
 #[tauri::command]
-pub async fn start_installation(textures_dir: String, window: Window) -> Result<(), String> {
+/// Returns the SHA of the installed commit
+pub async fn start_installation(textures_dir: String, window: Window) -> Result<String, String> {
     let git_path = get_git_path()?;
     let textures_path = PathBuf::from(&textures_dir);
     let temp_path = textures_path.join(TEMP_DIR_NAME);
@@ -512,82 +735,84 @@ pub async fn start_installation(textures_dir: String, window: Window) -> Result<
         },
     );
 
-    // Clean up any existing temp directory
-    if temp_path.exists() {
-        fs::remove_dir_all(&temp_path)
-            .map_err(|e| format!("Failed to clean temp directory: {}", e))?;
-    }
+    // Resume an earlier, interrupted download if one is present; otherwise
+    // start from a fresh clone (metadata only - file contents come later)
+    let listing = match resumable_listing(&git_path, &temp_path) {
+        Some(listing) => {
+            emit_progress(
+                &window,
+                "preparing",
+                "Found an unfinished download. Resuming where it left off...",
+                Some(0),
+            );
+            listing
+        }
+        None => {
+            clone_repository(&git_path, &temp_path, &window)?;
+            // A listing failure only costs the chunking: fall back to one chunk
+            list_textures(&git_path, &temp_path).unwrap_or_default()
+        }
+    };
 
-    // Create temp directory (only on macOS - on Windows, git clone will create it)
-    #[cfg(not(target_os = "windows"))]
-    fs::create_dir_all(&temp_path)
-        .map_err(|e| format!("Failed to create temp directory: {}", e))?;
+    // Record the commit actually being installed, so the first sync picks up
+    // anything committed after it (including while a resumed download waited)
+    let commit_sha = git_capture(&git_path, &temp_path, &["rev-parse", "HEAD"])
+        .map(|out| String::from_utf8_lossy(&out).trim().to_string())
+        .map_err(|e| format!("Could not read the downloaded commit: {}", e))?;
 
-    // Stage 1: Clone with sparse checkout (this is quick - just metadata)
-    let _ = window.emit(
-        "install-progress",
-        ProgressPayload {
-            stage: "cloning".to_string(),
-            message: "Initializing repository...".to_string(),
-            percent: Some(0),
-        },
+    // Stage 2: Download file contents in chunks - THIS IS THE MAIN DOWNLOAD
+    let mut chunks = chunking::plan_chunks(
+        SPARSE_PATH,
+        &chunking::parse_ls_tree(&listing),
+        CHUNK_MAX_BLOBS,
+        CHUNK_MAX_ARG_CHARS,
     );
+    if chunks.is_empty() {
+        chunks.push(Chunk { dirs: vec![SPARSE_PATH.to_string()], blobs: 1 });
+    }
+    let total_parts = chunks.len();
+    let total_blobs = chunks.iter().map(|c| c.blobs).sum::<usize>().max(1);
+    let mut done_blobs = 0;
 
-    let (clone_success, clone_output) = run_git_with_pty(
-        &git_path,
-        &[
-            "clone",
-            "--depth=1",
-            "--filter=blob:none",
-            "--sparse",
-            "--progress",
-            REPO_URL,
-            ".",
-        ],
-        &temp_path,
+    emit_progress(
         &window,
-        "cloning",
-        false, // Don't detect stages - keep showing "Initializing repository..."
-    )?;
-
-    if !clone_success {
-        let _ = fs::remove_dir_all(&temp_path);
-        let error_msg = if clone_output.is_empty() {
-            "Git clone has failed. Please check your internet connection.".to_string()
-        } else {
-            format!("Git clone has failed:\n{}", clone_output)
-        };
-        return Err(error_msg);
-    }
-
-    // Stage 2: Set sparse checkout path - THIS IS THE MAIN DOWNLOAD
-    let _ = window.emit(
-        "install-progress",
-        ProgressPayload {
-            stage: "downloading".to_string(),
-            message: format!("Starting download of {}...", SPARSE_PATH),
-            percent: Some(0),
-        },
+        "downloading",
+        &format!("Starting download of {} in {} parts...", SPARSE_PATH, total_parts),
+        Some(0),
     );
 
-    let (checkout_success, checkout_output) = run_git_with_pty(
+    for (index, chunk) in chunks.iter().enumerate() {
+        let lo = (done_blobs * 100 / total_blobs) as u32;
+        let hi = ((done_blobs + chunk.blobs) * 100 / total_blobs) as u32;
+        let part = format!("part {} of {}", index + 1, total_parts);
+        emit_progress(
+            &window,
+            "downloading",
+            &format!("Downloading {}: {}", part, describe_chunk(chunk)),
+            Some(lo),
+        );
+
+        let mut args = vec!["sparse-checkout", "add"];
+        args.extend(chunk.dirs.iter().map(String::as_str));
+        run_git_with_retries(&git_path, &args, &temp_path, &window, Some((lo, hi)), &part)
+            .map_err(|output| interrupted_message(index, total_parts, &output))?;
+
+        done_blobs += chunk.blobs;
+    }
+
+    // Switch to the plain folder pattern. Everything should already be
+    // present, so this normally downloads nothing - but it guarantees the
+    // result is complete even if the plan missed something.
+    emit_progress(&window, "extracting", "Checking that every file is present...", Some(100));
+    run_git_with_retries(
         &git_path,
         &["sparse-checkout", "set", SPARSE_PATH],
         &temp_path,
         &window,
-        "downloading",
-        true, // Detect stages - show compressing/downloading/extracting
-    )?;
-
-    if !checkout_success {
-        let _ = fs::remove_dir_all(&temp_path);
-        let error_msg = if checkout_output.is_empty() {
-            "Sparse checkout failed.".to_string()
-        } else {
-            format!("Sparse checkout failed:\n{}", checkout_output)
-        };
-        return Err(error_msg);
-    }
+        Some((100, 100)),
+        "the remaining files",
+    )
+    .map_err(|output| interrupted_message(total_parts, total_parts, &output))?;
 
     // Stage 3: Move folder to final location
     let _ = window.emit(
@@ -639,5 +864,5 @@ pub async fn start_installation(textures_dir: String, window: Window) -> Result<
         },
     );
 
-    Ok(())
+    Ok(commit_sha)
 }

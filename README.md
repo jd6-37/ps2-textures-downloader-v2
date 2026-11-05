@@ -114,7 +114,9 @@ Simply download the new `.dmg` and drag the app to your Applications folder, rep
 3. Click **Start Installation**
 4. Wait for the download to complete (this may take a while for large texture packs)
 
-The installer uses Git sparse checkout to efficiently download only the texture files. Progress is displayed in real-time. 
+The installer uses Git sparse checkout to efficiently download only the texture files. Progress is displayed in real-time.
+
+The download runs in parts. If your connection drops, the app retries the current part automatically. If it still can't finish, click **Start Installation** again: completed parts are kept and the download resumes where it left off.
 
 **Requirements for Mac Users Only**: Git must be installed. If you don't have it, install Xcode Command Line Tools by running in Terminal:
 ```bash
@@ -319,6 +321,14 @@ The Windows portable build requires MinGit to be manually bundled due to a Tauri
    - Attach to your GitHub release
 
 **Note**: The app looks for Git at `resources/mingit/x64/cmd/git.exe`. If this path doesn't exist, users will see an error asking them to install Git manually.
+
+### Download Chunking
+
+The installer splits the initial download into parts of roughly equal size and downloads them one at a time, so a dropped connection only costs the part in progress (which is retried automatically) rather than the whole download.
+
+The parts are planned automatically from your repository's folder structure, so there is no folder list to maintain: large folders are split into their subfolders, and small ones are grouped together. Identical files used in several folders are only downloaded once and are counted that way when sizing parts.
+
+The target part size is `CHUNK_MAX_BLOBS` in `src-tauri/src/config.rs`, measured in unique files. The default suits textures averaging around half a megabyte; lower it if your files are much larger.
 
 ### User-Customs Folder
 
