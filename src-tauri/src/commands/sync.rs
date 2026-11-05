@@ -728,7 +728,12 @@ async fn run_incremental_sync(
     let prefix = format!("{}/", SPARSE_PATH);
     let relevant_files: Vec<CompareFile> = changed_files
         .into_iter()
-        .filter(|f| f.filename.starts_with(&prefix) && !should_skip_path(&f.filename))
+        .filter(|f| {
+            let in_folder = |path: &str| path.starts_with(&prefix) && !should_skip_path(path);
+            // A file renamed out of the texture folder still has a local copy to remove
+            in_folder(&f.filename)
+                || (f.status == "renamed" && f.previous_filename.as_deref().map_or(false, in_folder))
+        })
         .collect();
 
     let total = relevant_files.len() as u32;
@@ -749,7 +754,22 @@ async fn run_incremental_sync(
     let mut downloads: Vec<DownloadJob> = Vec::new();
 
     for (i, file) in relevant_files.iter().enumerate() {
-        let relative_path = file.filename.strip_prefix(&prefix).unwrap().to_string();
+        let Some(relative_path) = file.filename.strip_prefix(&prefix).map(str::to_string) else {
+            // Renamed out of the texture folder: remove the old local copy
+            let old_rel_path = file.previous_filename.as_deref().and_then(|p| p.strip_prefix(&prefix));
+            if let Some(old_rel_path) = old_rel_path {
+                let (exists, _, old_local_path) = find_local_file(&slus_path, old_rel_path);
+                if exists {
+                    fs::remove_file(&old_local_path)
+                        .map_err(|e| format!("Failed to delete {}: {}", old_rel_path, e))?;
+                    deleted += 1;
+                    if let Some(parent) = old_local_path.parent() {
+                        let _ = fs::remove_dir(parent);
+                    }
+                }
+            }
+            continue;
+        };
 
         let _ = window.emit("sync-progress", SyncProgressPayload {
             stage: "syncing".to_string(),
@@ -790,42 +810,62 @@ async fn run_incremental_sync(
                 }
             }
             "renamed" => {
-                if let Some(old_filename) = &file.previous_filename {
-                    if old_filename.starts_with(&prefix) {
-                        let old_rel_path = old_filename.strip_prefix(&prefix).unwrap();
-                        let (exists, is_disabled, old_local_path) = find_local_file(&slus_path, old_rel_path);
+                // The old file's local copy, if it was inside the texture folder
+                let old_local = file
+                    .previous_filename
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix(&prefix))
+                    .map(|old_rel_path| find_local_file(&slus_path, old_rel_path))
+                    .filter(|(exists, _, _)| *exists);
 
-                        if exists {
-                            // Determine new path (preserve disabled state)
-                            let new_local_path = if is_disabled {
-                                slus_path.join(get_disabled_path(&relative_path))
-                            } else {
-                                slus_path.join(&relative_path)
-                            };
+                match old_local {
+                    Some((_, is_disabled, old_local_path)) => {
+                        // Preserve disabled state at the new path
+                        let new_local_path = if is_disabled {
+                            slus_path.join(get_disabled_path(&relative_path))
+                        } else {
+                            slus_path.join(&relative_path)
+                        };
 
-                            // Ensure parent directory exists
+                        // GitHub also reports a rename when a deleted file is paired with a
+                        // similar new one whose content differs, so moving the old file
+                        // would keep stale content. Only move it when it already matches.
+                        let unchanged = file.sha.as_deref().map_or(false, |sha| {
+                            compute_git_blob_sha_with_normalization(&old_local_path, Some(sha))
+                                .map_or(false, |local_sha| local_sha == sha)
+                        });
+
+                        if unchanged {
                             if let Some(parent) = new_local_path.parent() {
                                 fs::create_dir_all(parent)
                                     .map_err(|e| format!("Failed to create directory: {}", e))?;
                             }
-
-                            // Move the file
                             fs::rename(&old_local_path, &new_local_path)
-                                .map_err(|e| format!("Failed to rename {}: {}", old_rel_path, e))?;
+                                .map_err(|e| format!("Failed to rename {}: {}", relative_path, e))?;
                             renamed += 1;
-
-                            // Try to remove empty old parent directories
-                            if let Some(parent) = old_local_path.parent() {
-                                let _ = fs::remove_dir(parent);
-                            }
                         } else {
-                            // Old file doesn't exist locally, download the new one
+                            fs::remove_file(&old_local_path)
+                                .map_err(|e| format!("Failed to delete {}: {}", relative_path, e))?;
                             downloads.push(DownloadJob {
-                                dest: slus_path.join(&relative_path),
                                 path: relative_path,
+                                dest: new_local_path,
                                 sha: file.sha.clone(),
                             });
                         }
+
+                        // Try to remove empty old parent directories
+                        if let Some(parent) = old_local_path.parent() {
+                            let _ = fs::remove_dir(parent);
+                        }
+                    }
+                    None => {
+                        // No local copy to move (missing, or renamed in from outside the
+                        // texture folder): download the new file
+                        downloads.push(DownloadJob {
+                            dest: slus_path.join(&relative_path),
+                            path: relative_path,
+                            sha: file.sha.clone(),
+                        });
                     }
                 }
             }
