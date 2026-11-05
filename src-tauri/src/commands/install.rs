@@ -654,6 +654,11 @@ fn clone_repository(git_path: &str, temp_path: &PathBuf, window: &Window) -> Res
         git_path,
         &[
             "clone",
+            // Stored in the clone's config, so it also covers later fetches
+            "--config",
+            STALL_LOW_SPEED_LIMIT,
+            "--config",
+            STALL_LOW_SPEED_TIME,
             "--depth=1",
             "--filter=blob:none",
             "--sparse",
@@ -681,6 +686,12 @@ fn clone_repository(git_path: &str, temp_path: &PathBuf, window: &Window) -> Res
     Ok(())
 }
 
+/// Treat a download that stays below 1 KB/s for 60 seconds as a dropped
+/// connection. Without this, git waits indefinitely on a stalled connection
+/// (Wi-Fi off, network changed), so the retry never happens.
+const STALL_LOW_SPEED_LIMIT: &str = "http.lowSpeedLimit=1000";
+const STALL_LOW_SPEED_TIME: &str = "http.lowSpeedTime=60";
+
 /// Delays between attempts at one download step; one more attempt than entries
 /// (long enough for a laptop's network to reconnect after waking)
 const RETRY_DELAYS_SECS: [u64; 3] = [10, 30, 60];
@@ -696,11 +707,22 @@ fn run_git_with_retries(
     percent_range: Option<(u32, u32)>,
     what: &str,
 ) -> Result<(), String> {
+    // Passed on every run too, for clones made before the setting existed
+    let mut full_args = vec!["-c", STALL_LOW_SPEED_LIMIT, "-c", STALL_LOW_SPEED_TIME];
+    full_args.extend_from_slice(args);
+
     let mut attempt = 0;
     loop {
         clear_stale_git_files(repo);
-        let (success, output) =
-            run_git_with_pty(git_path, args, repo, window, "downloading", false, percent_range)?;
+        let (success, output) = run_git_with_pty(
+            git_path,
+            &full_args,
+            repo,
+            window,
+            "downloading",
+            false,
+            percent_range,
+        )?;
         if success {
             return Ok(());
         }
