@@ -282,6 +282,18 @@ Your texture repository must include an `installer-data.json` file in the root:
 | `total_size` | Displayed as "Estimated download size: X GB" on the Install tab. Accepts string or number. |
 | `downloader_app_url` | URL opened when users click "Download Latest Version" in the outdated app modal. |
 
+### Releasing a New Version
+
+Set the new version number in all three of these files, keeping them identical:
+
+| File | Field |
+|------|-------|
+| `src-tauri/tauri.conf.json` | `"version"` (the version the app reports and compares against `min_download_app_version`) |
+| `src-tauri/Cargo.toml` | `version` under `[package]` |
+| `package.json` | `"version"` |
+
+To make everyone update, raise `min_download_app_version` in your texture repository's `installer-data.json` to the new version, but only after the new build has been published. Users on an older version are blocked until they download it.
+
 ### Building the App
 
 Prerequisites:
