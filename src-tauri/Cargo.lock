@@ -2874,6 +2874,7 @@ version = "2.0.2"
 dependencies = [
  "chrono",
  "conpty",
+ "futures-util",
  "hex",
  "regex",
  "reqwest 0.11.27",

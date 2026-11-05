@@ -1,3 +1,4 @@
+use super::download::{download_files, http_client, DownloadJob};
 use super::power::KeepAwake;
 use crate::config::{user_agent, REPO_NAME, REPO_OWNER, SLUS_FOLDER, SPARSE_PATH};
 use reqwest::Client;
@@ -6,7 +7,6 @@ use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tauri::{Emitter, Window};
 
 /// GitHub tree entry from API response
@@ -56,7 +56,6 @@ struct CompareFile {
     filename: String,
     status: String, // "added", "modified", "removed", "renamed"
     previous_filename: Option<String>,
-    #[allow(dead_code)]
     sha: Option<String>,
 }
 
@@ -100,6 +99,9 @@ pub struct QuickCheckResult {
 pub struct VerificationFile {
     pub path: String,
     pub to_disabled: bool,
+    /// Blob id in the repository, so identical files are downloaded once
+    #[serde(default)]
+    pub sha: Option<String>,
 }
 
 /// Sync analysis result - what will happen if sync proceeds
@@ -120,6 +122,9 @@ pub struct SyncAnalysis {
 pub struct SyncFile {
     pub path: String,
     pub to_disabled: bool,
+    /// Blob id in the repository, so identical files are downloaded once
+    #[serde(default)]
+    pub sha: Option<String>,
 }
 
 /// Check if content is likely a text file (no null bytes in first 8KB)
@@ -658,93 +663,6 @@ fn build_local_file_map_recursive(
     Ok(())
 }
 
-/// HTTP client for sync requests. Without timeouts a stalled connection
-/// (Wi-Fi dropped, network changed) leaves a request waiting forever, and
-/// the sync never finishes or fails. The total timeout is per request and
-/// generous enough for the largest API responses on a slow connection.
-fn http_client() -> Client {
-    Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(300))
-        .build()
-        .unwrap_or_else(|_| Client::new())
-}
-
-/// Delays between attempts at downloading one file; one more attempt than entries
-const DOWNLOAD_RETRY_DELAYS_SECS: [u64; 2] = [10, 30];
-
-/// Download a file from GitHub raw content, retrying after network errors
-/// and server errors. A client error (such as 404) fails immediately.
-async fn download_file(
-    client: &Client,
-    relative_path: &str,
-    dest_path: &Path,
-    token: &Option<String>,
-) -> Result<(), String> {
-    let mut attempt = 0;
-    loop {
-        match download_file_once(client, relative_path, dest_path, token).await {
-            Ok(()) => return Ok(()),
-            Err((message, retryable)) => match DOWNLOAD_RETRY_DELAYS_SECS.get(attempt) {
-                Some(&delay) if retryable => {
-                    attempt += 1;
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                }
-                _ => return Err(message),
-            },
-        }
-    }
-}
-
-/// One download attempt. Errors carry whether a retry could help.
-async fn download_file_once(
-    client: &Client,
-    relative_path: &str,
-    dest_path: &Path,
-    token: &Option<String>,
-) -> Result<(), (String, bool)> {
-    let url = format!(
-        "https://raw.githubusercontent.com/{}/{}/main/{}/{}",
-        REPO_OWNER, REPO_NAME, SPARSE_PATH, relative_path
-    );
-
-    let mut req = client
-        .get(&url)
-        .header("User-Agent", user_agent());
-
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {}", t));
-    }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| (format!("Failed to download file: {}", e), true))?;
-
-    if !response.status().is_success() {
-        return Err((
-            format!("Failed to download {}: HTTP {}", relative_path, response.status()),
-            !response.status().is_client_error(),
-        ));
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| (format!("Failed to read file content: {}", e), true))?;
-
-    // Ensure parent directory exists
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| (format!("Failed to create directory: {}", e), false))?;
-    }
-
-    fs::write(dest_path, &bytes)
-        .map_err(|e| (format!("Failed to write file: {}", e), false))?;
-
-    Ok(())
-}
-
 /// Check if a local file exists (either normal or disabled version)
 /// Returns (exists, is_disabled, actual_path)
 fn find_local_file(slus_path: &Path, relative_path: &str) -> (bool, bool, PathBuf) {
@@ -821,10 +739,14 @@ async fn run_incremental_sync(
         total: None,
     });
 
-    let mut downloaded: u32 = 0;
     let mut deleted: u32 = 0;
     let mut renamed: u32 = 0;
     let mut skipped: u32 = 0;
+
+    // Renames and deletions happen here, in order; downloads are collected
+    // and run in parallel afterwards. Doing them last also means a file added
+    // at a path another file was renamed away from can't be moved by mistake.
+    let mut downloads: Vec<DownloadJob> = Vec::new();
 
     for (i, file) in relevant_files.iter().enumerate() {
         let relative_path = file.filename.strip_prefix(&prefix).unwrap().to_string();
@@ -841,16 +763,17 @@ async fn run_incremental_sync(
                 // Check if we have a disabled version locally
                 let (exists, is_disabled, local_path) = find_local_file(&slus_path, &relative_path);
 
-                if exists && is_disabled {
+                let dest = if exists && is_disabled {
                     // Download to the disabled path (preserve disabled state)
-                    let disabled_rel_path = get_disabled_path(&relative_path);
-                    let dest = slus_path.join(&disabled_rel_path);
-                    download_file(&client, &relative_path, &dest, token).await?;
+                    slus_path.join(get_disabled_path(&relative_path))
                 } else {
-                    // Download to normal path
-                    download_file(&client, &relative_path, &local_path, token).await?;
-                }
-                downloaded += 1;
+                    local_path
+                };
+                downloads.push(DownloadJob {
+                    path: relative_path,
+                    dest,
+                    sha: file.sha.clone(),
+                });
             }
             "removed" => {
                 // Delete the file (check both normal and disabled versions)
@@ -897,9 +820,11 @@ async fn run_incremental_sync(
                             }
                         } else {
                             // Old file doesn't exist locally, download the new one
-                            let dest = slus_path.join(&relative_path);
-                            download_file(&client, &relative_path, &dest, token).await?;
-                            downloaded += 1;
+                            downloads.push(DownloadJob {
+                                dest: slus_path.join(&relative_path),
+                                path: relative_path,
+                                sha: file.sha.clone(),
+                            });
                         }
                     }
                 }
@@ -909,6 +834,16 @@ async fn run_incremental_sync(
             }
         }
     }
+
+    let downloaded = download_files(&client, downloads, token, |done, total, path| {
+        let _ = window.emit("sync-progress", SyncProgressPayload {
+            stage: "downloading".to_string(),
+            message: format!("Downloading: {}", path),
+            current: Some(done),
+            total: Some(total),
+        });
+    })
+    .await?;
 
     let _ = window.emit("sync-progress", SyncProgressPayload {
         stage: "complete".to_string(),
@@ -1079,25 +1014,27 @@ async fn run_full_sync(
 
     // Download files
     let client = http_client();
-    let mut downloaded: u32 = 0;
-
-    for (i, (path, is_disabled)) in files_to_download.iter().enumerate() {
+    let jobs = files_to_download
+        .iter()
+        .map(|(path, is_disabled)| DownloadJob {
+            path: path.clone(),
+            dest: if *is_disabled {
+                slus_path.join(get_disabled_path(path))
+            } else {
+                slus_path.join(path)
+            },
+            sha: remote_files.get(path).cloned(),
+        })
+        .collect();
+    let downloaded = download_files(&client, jobs, token, |done, total, path| {
         let _ = window.emit("sync-progress", SyncProgressPayload {
             stage: "downloading".to_string(),
             message: format!("Downloading: {}", path),
-            current: Some(i as u32 + 1),
-            total: Some(download_count),
+            current: Some(done),
+            total: Some(total),
         });
-
-        let dest_path = if *is_disabled {
-            slus_path.join(get_disabled_path(path))
-        } else {
-            slus_path.join(path)
-        };
-
-        download_file(&client, path, &dest_path, token).await?;
-        downloaded += 1;
-    }
+    })
+    .await?;
 
     // Delete files
     let mut deleted: u32 = 0;
@@ -1199,6 +1136,7 @@ pub async fn run_verification_scan(
             files_to_download.push(VerificationFile {
                 path: repo_path.clone(),
                 to_disabled: false,
+                sha: Some(repo_sha.clone()),
             });
             continue;
         }
@@ -1217,6 +1155,7 @@ pub async fn run_verification_scan(
             files_to_download.push(VerificationFile {
                 path: repo_path.clone(),
                 to_disabled: true,
+                sha: Some(repo_sha.clone()),
             });
             continue;
         }
@@ -1225,6 +1164,7 @@ pub async fn run_verification_scan(
         files_to_download.push(VerificationFile {
             path: repo_path.clone(),
             to_disabled: false,
+            sha: Some(repo_sha.clone()),
         });
     }
 
@@ -1304,23 +1244,27 @@ pub async fn apply_verification_fixes(
             total: None,
         });
 
-        for (i, file) in files_to_download.iter().enumerate() {
+        let jobs = files_to_download
+            .iter()
+            .map(|file| DownloadJob {
+                path: file.path.clone(),
+                dest: if file.to_disabled {
+                    slus_path.join(get_disabled_path(&file.path))
+                } else {
+                    slus_path.join(&file.path)
+                },
+                sha: file.sha.clone(),
+            })
+            .collect();
+        downloaded = download_files(&client, jobs, &github_token, |done, total, path| {
             let _ = window.emit("sync-progress", SyncProgressPayload {
                 stage: "verifying".to_string(),
-                message: format!("Downloading: {}", file.path),
-                current: Some(i as u32 + 1),
+                message: format!("Downloading: {}", path),
+                current: Some(done),
                 total: Some(total),
             });
-
-            let dest_path = if file.to_disabled {
-                slus_path.join(get_disabled_path(&file.path))
-            } else {
-                slus_path.join(&file.path)
-            };
-
-            download_file(&client, &file.path, &dest_path, &github_token).await?;
-            downloaded += 1;
-        }
+        })
+        .await?;
     }
 
     // Delete orphaned files
@@ -1609,7 +1553,7 @@ pub async fn analyze_full_sync(
                 }
             }
             // File exists but different - will be REPLACED
-            files_to_replace.push(SyncFile { path: path.clone(), to_disabled: false });
+            files_to_replace.push(SyncFile { path: path.clone(), to_disabled: false, sha: Some(remote_sha.clone()) });
             continue;
         }
 
@@ -1623,12 +1567,12 @@ pub async fn analyze_full_sync(
                 }
             }
             // Disabled file exists but different - will be REPLACED
-            files_to_replace.push(SyncFile { path: path.clone(), to_disabled: true });
+            files_to_replace.push(SyncFile { path: path.clone(), to_disabled: true, sha: Some(remote_sha.clone()) });
             continue;
         }
 
         // File doesn't exist locally - will be ADDED
-        files_to_add.push(SyncFile { path: path.clone(), to_disabled: false });
+        files_to_add.push(SyncFile { path: path.clone(), to_disabled: false, sha: Some(remote_sha.clone()) });
     }
 
     // Determine files to delete
@@ -1713,25 +1657,27 @@ pub async fn execute_analyzed_sync(
 
     // Download files
     let client = http_client();
-    let mut downloaded: u32 = 0;
-
-    for (i, file) in files_to_download.iter().enumerate() {
+    let jobs = files_to_download
+        .iter()
+        .map(|file| DownloadJob {
+            path: file.path.clone(),
+            dest: if file.to_disabled {
+                slus_path.join(get_disabled_path(&file.path))
+            } else {
+                slus_path.join(&file.path)
+            },
+            sha: file.sha.clone(),
+        })
+        .collect();
+    let downloaded = download_files(&client, jobs, &github_token, |done, total, path| {
         let _ = window.emit("sync-progress", SyncProgressPayload {
             stage: "downloading".to_string(),
-            message: format!("Downloading: {}", file.path),
-            current: Some(i as u32 + 1),
-            total: Some(download_count),
+            message: format!("Downloading: {}", path),
+            current: Some(done),
+            total: Some(total),
         });
-
-        let dest_path = if file.to_disabled {
-            slus_path.join(get_disabled_path(&file.path))
-        } else {
-            slus_path.join(&file.path)
-        };
-
-        download_file(&client, &file.path, &dest_path, &github_token).await?;
-        downloaded += 1;
-    }
+    })
+    .await?;
 
     // Delete files
     let mut deleted: u32 = 0;

@@ -1,0 +1,168 @@
+//! Downloading texture files from the repository over HTTP.
+//!
+//! Used by sync on every platform. Independent of the app window, so the
+//! same engine can serve installs where git isn't available.
+
+use crate::config::{user_agent, REPO_NAME, REPO_OWNER, SPARSE_PATH};
+use futures_util::stream::{self, StreamExt};
+use reqwest::Client;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// HTTP client for sync requests. Without timeouts a stalled connection
+/// (Wi-Fi dropped, network changed) leaves a request waiting forever, and
+/// the sync never finishes or fails. The total timeout is per request and
+/// generous enough for the largest API responses on a slow connection.
+pub(crate) fn http_client() -> Client {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
+/// Delays between attempts at downloading one file; one more attempt than entries
+const DOWNLOAD_RETRY_DELAYS_SECS: [u64; 2] = [10, 30];
+
+/// Download a file from GitHub raw content, retrying after network errors
+/// and server errors. A client error (such as 404) fails immediately.
+async fn download_file(
+    client: &Client,
+    relative_path: &str,
+    dest_path: &Path,
+    token: &Option<String>,
+) -> Result<(), String> {
+    let mut attempt = 0;
+    loop {
+        match download_file_once(client, relative_path, dest_path, token).await {
+            Ok(()) => return Ok(()),
+            Err((message, retryable)) => match DOWNLOAD_RETRY_DELAYS_SECS.get(attempt) {
+                Some(&delay) if retryable => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                }
+                _ => return Err(message),
+            },
+        }
+    }
+}
+
+/// One download attempt. Errors carry whether a retry could help.
+async fn download_file_once(
+    client: &Client,
+    relative_path: &str,
+    dest_path: &Path,
+    token: &Option<String>,
+) -> Result<(), (String, bool)> {
+    let url = format!(
+        "https://raw.githubusercontent.com/{}/{}/main/{}/{}",
+        REPO_OWNER, REPO_NAME, SPARSE_PATH, relative_path
+    );
+
+    let mut req = client
+        .get(&url)
+        .header("User-Agent", user_agent());
+
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {}", t));
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| (format!("Failed to download file: {}", e), true))?;
+
+    if !response.status().is_success() {
+        return Err((
+            format!("Failed to download {}: HTTP {}", relative_path, response.status()),
+            !response.status().is_client_error(),
+        ));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| (format!("Failed to read file content: {}", e), true))?;
+
+    // Ensure parent directory exists
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| (format!("Failed to create directory: {}", e), false))?;
+    }
+
+    fs::write(dest_path, &bytes)
+        .map_err(|e| (format!("Failed to write file: {}", e), false))?;
+
+    Ok(())
+}
+
+/// How many files download at once. Each raw download spends most of its
+/// time waiting for the server to start responding, so running several at
+/// once is what makes large downloads fast. Higher values stop helping once
+/// the connection is saturated, and on a slow connection split the bandwidth
+/// so thinly that the largest textures could hit the request timeout.
+const DOWNLOAD_CONCURRENCY: usize = 8;
+
+/// One file to download: its path in the repository, where it goes locally,
+/// and its blob id when known.
+pub(crate) struct DownloadJob {
+    pub path: String,
+    pub dest: PathBuf,
+    pub sha: Option<String>,
+}
+
+/// Download files in parallel. Jobs that share a blob id (texture packs reuse
+/// identical files heavily) are downloaded once and copied to the other
+/// destinations. `on_progress(done, total, path)` runs after each file.
+/// Stops at the first error; files already written stay in place, so a
+/// re-run only fetches what's still missing.
+pub(crate) async fn download_files(
+    client: &Client,
+    jobs: Vec<DownloadJob>,
+    token: &Option<String>,
+    mut on_progress: impl FnMut(u32, u32, &str),
+) -> Result<u32, String> {
+    let total = jobs.len() as u32;
+
+    // Group by blob id; jobs without one download on their own
+    let mut groups: Vec<Vec<DownloadJob>> = Vec::new();
+    let mut group_of: HashMap<String, usize> = HashMap::new();
+    for job in jobs {
+        let existing = job.sha.as_ref().and_then(|sha| group_of.get(sha).copied());
+        match existing {
+            Some(index) => groups[index].push(job),
+            None => {
+                if let Some(sha) = &job.sha {
+                    group_of.insert(sha.clone(), groups.len());
+                }
+                groups.push(vec![job]);
+            }
+        }
+    }
+
+    let mut transfers = stream::iter(groups.into_iter().map(|group| async move {
+        let first = &group[0];
+        download_file(client, &first.path, &first.dest, token).await?;
+        for copy in &group[1..] {
+            if let Some(parent) = copy.dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create directory: {}", e))?;
+            }
+            fs::copy(&first.dest, &copy.dest)
+                .map_err(|e| format!("Failed to copy {} to {}: {}", first.path, copy.path, e))?;
+        }
+        Ok::<_, String>(group)
+    }))
+    .buffer_unordered(DOWNLOAD_CONCURRENCY);
+
+    let mut done: u32 = 0;
+    while let Some(result) = transfers.next().await {
+        for job in result? {
+            done += 1;
+            on_progress(done, total, &job.path);
+        }
+    }
+    Ok(done)
+}
