@@ -746,6 +746,21 @@ fn run_git_with_retries(
     }
 }
 
+/// Arguments for a cone-mode `sparse-checkout` command. Git rejects folder
+/// names containing `* ? [ ] \` as if they were patterns, failing that chunk
+/// on every attempt; with `--skip-checks` it escapes them and matches the
+/// names exactly. The flag is only added when a name needs it, because older
+/// git versions don't recognise it.
+fn sparse_checkout_args<'a>(subcommand: &'a str, dirs: &[&'a str]) -> Vec<&'a str> {
+    const GLOB_CHARS: &[char] = &['*', '?', '[', ']', '\\'];
+    let mut args = vec!["sparse-checkout", subcommand];
+    if dirs.iter().any(|dir| dir.contains(GLOB_CHARS)) {
+        args.push("--skip-checks");
+    }
+    args.extend_from_slice(dirs);
+    args
+}
+
 /// Short label for a chunk: its first folder (relative to SPARSE_PATH)
 fn describe_chunk(chunk: &Chunk) -> String {
     let prefix = format!("{}/", SPARSE_PATH);
@@ -844,8 +859,8 @@ pub async fn start_installation(textures_dir: String, window: Window) -> Result<
             Some(lo),
         );
 
-        let mut args = vec!["sparse-checkout", "add"];
-        args.extend(chunk.dirs.iter().map(String::as_str));
+        let dirs: Vec<&str> = chunk.dirs.iter().map(String::as_str).collect();
+        let args = sparse_checkout_args("add", &dirs);
         run_git_with_retries(&git_path, &args, &temp_path, &window, Some((lo, hi)), &part)
             .map_err(|output| interrupted_message(index, total_parts, &output))?;
 
@@ -858,7 +873,7 @@ pub async fn start_installation(textures_dir: String, window: Window) -> Result<
     emit_progress(&window, "extracting", "Checking that every file is present...", Some(100));
     run_git_with_retries(
         &git_path,
-        &["sparse-checkout", "set", SPARSE_PATH],
+        &sparse_checkout_args("set", &[SPARSE_PATH]),
         &temp_path,
         &window,
         Some((100, 100)),
