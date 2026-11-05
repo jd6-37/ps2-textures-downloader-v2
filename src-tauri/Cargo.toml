@@ -1,6 +1,6 @@
 [package]
 name = "ps2-textures-downloader"
-version = "2.0.2"
+version = "2.0.3"
 description = "Download and sync texture replacement packs for PS2 mod projects"
 edition = "2021"
 
