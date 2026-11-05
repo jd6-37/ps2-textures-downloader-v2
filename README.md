@@ -11,6 +11,7 @@ A cross-platform desktop app for PS2 mod projects that helps users download and 
 - [Installation](#installation)
   - [Windows](#installation--windows)
   - [macOS](#installation--macos)
+  - [Linux](#installation--linux)
 - [Uninstalling](#uninstalling)
 - [Using the App](#usage)
   - [First Time Setup](#usage--setup)
@@ -103,6 +104,19 @@ The dash prefix "disables" the texture - the emulator ignores it, but the app st
 
 Simply download the new `.dmg` and drag the app to your Applications folder, replacing the old version. Your settings are stored in your user Library folder and will be preserved.
 
+### Linux <a name="installation--linux"></a>
+
+Two formats are available from the [latest release](../../releases/latest):
+
+- **AppImage** (any distribution): download the `.AppImage` file, make it executable (`chmod +x *.AppImage`, or tick "Allow executing file as program" in its file properties) and run it.
+- **.deb** (Debian, Ubuntu, Mint, Pop!_OS): install with `sudo apt install ./<file>.deb`.
+
+Git must be installed. Most distributions include it; if not, install it with your package manager (for example `sudo apt install git`).
+
+#### Updating the App (Linux)
+
+Replace the AppImage with the new one, or install the new `.deb` over the old one. Your settings are stored in `~/.local/share` and will be preserved.
+
 ---
 
 ## Using the App <a name="usage"></a>
@@ -114,7 +128,11 @@ Simply download the new `.dmg` and drag the app to your Applications folder, rep
 3. Click **Start Installation**
 4. Wait for the download to complete (this may take a while for large texture packs)
 
-The installer uses Git sparse checkout to efficiently download only the texture files. Progress is displayed in real-time. 
+The installer uses Git sparse checkout to efficiently download only the texture files. Progress is displayed in real-time.
+
+The download runs in parts. If your connection drops, the app retries the current part automatically. If it still can't finish, click **Start Installation** again: completed parts are kept and the download resumes where it left off.
+
+The app keeps your computer from going to sleep while installing or syncing. It can't stop sleep you ask for, so keep a laptop's lid open (and ideally plugged in) until it finishes.
 
 **Requirements for Mac Users Only**: Git must be installed. If you don't have it, install Xcode Command Line Tools by running in Terminal:
 ```bash
@@ -165,6 +183,11 @@ A GitHub Personal Access Token is required for the sync features. Here's how to 
 
 1. Delete the app from Applications
 2. Delete `~/Library/Application Support/com.ncaanext.textures-downloader`
+
+#### Uninstalling (Linux)
+
+1. Delete the AppImage, or remove the `.deb` package with `sudo apt remove <package-name>`
+2. Delete `~/.local/share/com.ncaanext.textures-downloader`
 
 ---
 
@@ -259,6 +282,18 @@ Your texture repository must include an `installer-data.json` file in the root:
 | `total_size` | Displayed as "Estimated download size: X GB" on the Install tab. Accepts string or number. |
 | `downloader_app_url` | URL opened when users click "Download Latest Version" in the outdated app modal. |
 
+### Releasing a New Version
+
+Set the new version number in all three of these files, keeping them identical:
+
+| File | Field |
+|------|-------|
+| `src-tauri/tauri.conf.json` | `"version"` (the version the app reports and compares against `min_download_app_version`) |
+| `src-tauri/Cargo.toml` | `version` under `[package]` |
+| `package.json` | `"version"` |
+
+To make everyone update, raise `min_download_app_version` in your texture repository's `installer-data.json` to the new version, but only after the new build has been published. Users on an older version are blocked until they download it.
+
 ### Building the App
 
 Prerequisites:
@@ -282,6 +317,7 @@ npm run tauri build
 The repository includes GitHub Actions workflows for automated builds. On each push to `main`, it builds:
 - Windows: Portable `.exe` + `resources` folder
 - macOS: `.dmg` installer (universal binary for Intel and Apple Silicon)
+- Linux: `.AppImage` and `.deb`, built on Ubuntu 22.04 so they run on that release and newer
 
 Build artifacts are attached to each workflow run and can be downloaded from the Actions tab.
 
@@ -319,6 +355,14 @@ The Windows portable build requires MinGit to be manually bundled due to a Tauri
    - Attach to your GitHub release
 
 **Note**: The app looks for Git at `resources/mingit/x64/cmd/git.exe`. If this path doesn't exist, users will see an error asking them to install Git manually.
+
+### Download Chunking
+
+The installer splits the initial download into parts of roughly equal size and downloads them one at a time, so a dropped connection only costs the part in progress (which is retried automatically) rather than the whole download.
+
+The parts are planned automatically from your repository's folder structure, so there is no folder list to maintain: large folders are split into their subfolders, and small ones are grouped together. Identical files used in several folders are only downloaded once and are counted that way when sizing parts.
+
+The target part size is `CHUNK_MAX_BLOBS` in `src-tauri/src/config.rs`, measured in unique files. The default suits textures averaging around half a megabyte; lower it if your files are much larger.
 
 ### User-Customs Folder
 
