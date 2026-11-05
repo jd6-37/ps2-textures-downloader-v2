@@ -188,7 +188,7 @@ A GitHub Personal Access Token is required for the sync features. Here's how to 
 #### Uninstalling (Linux)
 
 1. Delete the AppImage, or remove the `.deb` package with `sudo apt remove <package-name>`
-2. Delete `~/.local/share/com.ncaanext.textures-downloader`
+2. Delete `~/.local/share/<app-identifier>` (see the Windows note above for where to find the identifier)
 
 ---
 
