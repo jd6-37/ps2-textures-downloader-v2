@@ -1,5 +1,5 @@
 use super::power::KeepAwake;
-use crate::config::{REPO_NAME, REPO_OWNER, SLUS_FOLDER, SPARSE_PATH};
+use crate::config::{user_agent, REPO_NAME, REPO_OWNER, SLUS_FOLDER, SPARSE_PATH};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -345,7 +345,7 @@ fn get_enabled_path(path: &str) -> Option<String> {
 fn build_request(client: &Client, url: &str, token: &Option<String>) -> reqwest::RequestBuilder {
     let mut req = client
         .get(url)
-        .header("User-Agent", "NCAA-NEXT-Textures-Downloader")
+        .header("User-Agent", user_agent())
         .header("Accept", "application/vnd.github.v3+json");
 
     if let Some(t) = token {
@@ -428,7 +428,7 @@ async fn fetch_tree(client: &Client, tree_sha: &str, recursive: bool, token: &Op
         .map_err(|e| format!("Failed to parse tree response: {}", e))
 }
 
-/// Navigate to a subtree by path (e.g., "textures/SLUS-21214")
+/// Navigate to a subtree by path (e.g., "textures/SLUS-XXXXX")
 async fn get_subtree_sha(client: &Client, root_sha: &str, path: &str, token: &Option<String>) -> Result<String, String> {
     let parts: Vec<&str> = path.split('/').collect();
     let mut current_sha = root_sha.to_string();
@@ -710,7 +710,7 @@ async fn download_file_once(
 
     let mut req = client
         .get(&url)
-        .header("User-Agent", "NCAA-NEXT-Textures-Downloader");
+        .header("User-Agent", user_agent());
 
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {}", t));

@@ -176,18 +176,19 @@ A GitHub Personal Access Token is required for the sync features. Here's how to 
 #### Uninstalling (Windows)
 
 1. Delete the app folder you extracted
-2. To remove saved settings, delete `%LOCALAPPDATA%\com.ncaanext.textures-downloader` (paste this path
-  in File Explorer's address bar)
+2. To remove saved settings, delete `%LOCALAPPDATA%\<app-identifier>` (paste this path
+  in File Explorer's address bar). `<app-identifier>` is the `identifier` value in `src-tauri/tauri.conf.json`
+  (e.g. `com.yourteam.textures-downloader`).
 
 #### Uninstalling (MacOS)
 
 1. Delete the app from Applications
-2. Delete `~/Library/Application Support/com.ncaanext.textures-downloader`
+2. Delete `~/Library/Application Support/<app-identifier>` (see the Windows note above for where to find the identifier)
 
 #### Uninstalling (Linux)
 
 1. Delete the AppImage, or remove the `.deb` package with `sudo apt remove <package-name>`
-2. Delete `~/.local/share/com.ncaanext.textures-downloader`
+2. Delete `~/.local/share/<app-identifier>` (see the Windows note above for where to find the identifier)
 
 ---
 
@@ -197,11 +198,14 @@ This app is open-source and can be customized for any PS2 texture replacement mo
 
 ### Configuration Files
 
-You need to update two configuration files:
+You need to update the following configuration files and assets:
 
 #### Backend: `src-tauri/src/config.rs`
 
 ```rust
+/// Application title (also used to build the User-Agent sent to GitHub)
+pub const APP_TITLE: &str = "Your Mod Name Textures Downloader";
+
 /// Repository owner (GitHub username or organization)
 pub const REPO_OWNER: &str = "your-github-username";
 
@@ -245,8 +249,24 @@ Update the app identifier, title, and other metadata:
 {
   "productName": "Your Mod Textures Downloader",
   "identifier": "com.yourteam.textures-downloader",
+  "mainBinaryName": "your-mod-textures-downloader",
   ...
 }
+```
+
+`mainBinaryName` sets the executable's filename (without `.exe`). Keep it the same across releases
+so Windows users who extract a new version over the old folder don't end up with two executables.
+
+The `identifier` also determines where the app stores user settings. If you publish install
+instructions for your users, update the uninstall paths to match it.
+
+#### App Icons: `src-tauri/icons/`
+
+The bundled icons are the upstream project's logo. Replace them with your own before building.
+The easiest way is to generate the full set from a single square PNG (1024x1024 recommended):
+
+```bash
+npm run tauri icon path/to/your-icon.png
 ```
 
 ### Repository Structure
@@ -376,7 +396,7 @@ To pull bug fixes and new features from the upstream repository into your fork:
 
 ```bash
 # Add upstream remote (one-time setup)
-git remote add upstream https://github.com/jd6-37/ps2-textures-downloader.git
+git remote add upstream https://github.com/jd6-37/ps2-textures-downloader-v2.git
 
 # Fetch and merge upstream changes
 git fetch upstream
